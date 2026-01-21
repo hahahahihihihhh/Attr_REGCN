@@ -1,0 +1,12 @@
+{
+    "NYCTAXI20140103": {
+      "relation_kg_path": "../raw_data/NYCTAXI20140103/adjx_kg.csv",
+      "attribute_kg_path": "../raw_data/NYCTAXI20140103/weather_kg.csv",
+      "data_dir": "../data/NYCMET20140103"
+    },
+    "TDRIVE20150406": {
+      "relation_kg_path": "../raw_data/TDRIVE20150406/adjx_kg.csv",
+      "attribute_kg_path": "../raw_data/TDRIVE20150406/weather_kg.csv",
+      "data_dir": "../data/BJMET20140103"
+    }
+}

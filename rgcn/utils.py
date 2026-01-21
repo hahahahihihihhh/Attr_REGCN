@@ -5,6 +5,7 @@ https://github.com/MichSchli/RelationPrediction
 
 """
 import numpy as np
+import re
 import torch
 import dgl
 from tqdm import tqdm
@@ -97,43 +98,46 @@ def r2e(triplets, num_rels):
     return uniq_r, r_len, e_idx
 
 
-def build_sub_graph(num_nodes, num_rels, triples, use_cuda, gpu):
+def build_sub_graph_rel_attr(num_nodes, num_ent, triples, use_cuda, gpu):
     """
     :param node_id: node id in the large graph
-    :param num_rels: number of relation
+    :param num_ent: number of entity
     :param src: relabeled src id
     :param rel: original rel id
     :param dst: relabeled dst id
     :param use_cuda:
     :return:
     """
-    def comp_deg_norm(g):
-        in_deg = g.in_degrees(range(g.number_of_nodes())).float()
-        in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
-        norm = 1.0 / in_deg
+    def comp_deg_norm_rel(g):
+        out_deg = g.out_degrees(range(g.number_of_nodes())).float()
+        out_deg[torch.nonzero(out_deg == 0).view(-1)] = 1
+        norm = 1.0 / out_deg
         return norm
 
     src, rel, dst = triples.transpose()
-    src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
-    rel = np.concatenate((rel, rel + num_rels))
-
-    g = dgl.DGLGraph()
-    g.add_nodes(num_nodes)
-    g.add_edges(src, dst)
-    norm = comp_deg_norm(g)
+    # relation subgraph
+    rel_src = src[(src < num_ent) & (dst < num_ent)]
+    rel_rel = rel[(src < num_ent) & (dst < num_ent)]
+    rel_dst = dst[(src < num_ent) & (dst < num_ent)]
+    rel_g = dgl.DGLGraph()
+    rel_g.add_nodes(num_ent)
+    rel_g.add_edges(rel_src, rel_dst)
+    rel_norm = comp_deg_norm_rel(rel_g)
+    node_id = torch.arange(0, num_ent, dtype=torch.long).view(-1, 1)
+    rel_g.ndata.update({'id': node_id, 'norm': rel_norm.view(-1, 1)})
+    rel_g.edata['type'] = torch.LongTensor(rel_rel)
+    # attr subgraph
+    attr_src = src[(src >= num_ent) | (dst >= num_ent)]
+    attr_rel = rel[(src >= num_ent) | (dst >= num_ent)]
+    attr_dst = dst[(src >= num_ent) | (dst >= num_ent)]
+    attr_g = dgl.DGLGraph()
+    attr_g.add_nodes(num_nodes)
+    attr_g.add_edges(attr_src, attr_dst)
     node_id = torch.arange(0, num_nodes, dtype=torch.long).view(-1, 1)
-    g.ndata.update({'id': node_id, 'norm': norm.view(-1, 1)})
-    g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
-    g.edata['type'] = torch.LongTensor(rel)
+    attr_g.ndata.update({'id': node_id})
+    attr_g.edata['type'] = torch.LongTensor(attr_rel)
+    return rel_g, attr_g
 
-    uniq_r, r_len, r_to_e = r2e(triples, num_rels)
-    g.uniq_r = uniq_r
-    g.r_to_e = r_to_e
-    g.r_len = r_len
-    if use_cuda:
-        g = g.to(gpu) 
-        g.r_to_e = torch.from_numpy(np.array(r_to_e))
-    return g
 
 def get_total_rank(test_triples, score, all_ans, eval_bz, rel_predict=0):
     num_triples = len(test_triples)
@@ -361,7 +365,7 @@ def load_data(dataset, bfs_level=3, relabel=False):
     elif dataset in ['FB15k', 'wn18', 'FB15k-237']:
         return knwlgrh.load_link(dataset)
     elif dataset in ['ICEWS18', 'ICEWS14', "GDELT", "SMALL", "ICEWS14s", "ICEWS05-15","YAGO",
-                     "WIKI"]:
+                     "WIKI", "TEST", "NYCMET20140103", "BJMET20150406"]:
         return knwlgrh.load_from_local("../data", dataset)
     else:
         raise ValueError('Unknown dataset: {}'.format(dataset))
@@ -447,3 +451,11 @@ def soft_max(z):
     t = np.exp(z)
     a = np.exp(z) / np.sum(t)
     return a
+
+
+def sanitize_filename(name):
+    """
+    Make filename safe for both Windows & Linux
+    """
+    # Windows illegal chars: < > : " / \ | ? *
+    return re.sub(r'[<>:"/\\|?*]', '_', name)
