@@ -361,7 +361,7 @@ def main_build(
 # 4) 入口：从 settings.json 读取路径
 # =========================
 if __name__ == "__main__":
-    dataset = "NYCTAXI20140103"  # 你可改成自己的 key
+    dataset = "TDRIVE20150406"  # 你可改成自己的 key
     with open("settings.json", "r", encoding="utf-8") as f:
         settings = json.load(f)
     cfg = settings[dataset]
@@ -374,11 +374,10 @@ if __name__ == "__main__":
     weather_kg = cfg["attribute_kg_path"]
     data_dir = cfg["data_dir"]
 
-    out_dir = os.path.join(data_dir, "meteorological_kg_embed")
     main_build(
         adjx_csv=adjx_kg,
         weather_csv=weather_kg,
-        out_dir=out_dir,
+        out_dir=data_dir,
         met_vars=METEOROLOGICAL_VARS,
         chunksize=1_000_000,
     )
