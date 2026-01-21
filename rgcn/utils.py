@@ -172,15 +172,15 @@ def get_total_rank(test_triples, score, all_ans, eval_bz, rel_predict=0):
     return filter_mrr.item(), mrr.item(), rank, filter_rank
 
 
-def stat_ranks(rank_list, method):
+def stat_ranks(logger, rank_list, method):
     hits = [1, 3, 10]
     total_rank = torch.cat(rank_list)
 
     mrr = torch.mean(1.0 / total_rank.float())
-    print("MRR ({}): {:.6f}".format(method, mrr.item()))
+    logger.info("MRR ({}): {:.6f}".format(method, mrr.item()))
     for hit in hits:
         avg_count = torch.mean((total_rank <= hit).float())
-        print("Hits ({}) @ {}: {:.6f}".format(method, hit, avg_count.item()))
+        logger.info("Hits ({}) @ {}: {:.6f}".format(method, hit, avg_count.item()))
     return mrr
 
 
@@ -365,7 +365,7 @@ def load_data(dataset, bfs_level=3, relabel=False):
     elif dataset in ['FB15k', 'wn18', 'FB15k-237']:
         return knwlgrh.load_link(dataset)
     elif dataset in ['ICEWS18', 'ICEWS14', "GDELT", "SMALL", "ICEWS14s", "ICEWS05-15","YAGO",
-                     "WIKI", "TEST", "NYCMET20140103", "BJMET20150406"]:
+                     "WIKI", "TEST", "NYCTAXI20140103", "TDRIVE20150406"]:
         return knwlgrh.load_from_local("../data", dataset)
     else:
         raise ValueError('Unknown dataset: {}'.format(dataset))

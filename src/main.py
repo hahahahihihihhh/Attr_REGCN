@@ -9,9 +9,11 @@ The entry of the KGEvolve
 
 import argparse
 import itertools
+import json
+import logging
 import os
 import sys
-
+from logging.handlers import RotatingFileHandler
 
 import numpy as np
 import torch
@@ -26,24 +28,73 @@ from src.hyperparameter_range import hp_range
 import torch.nn.modules.rnn
 import torch.nn.functional as F
 
+dataset = "TEST"  # 你可改成自己的 key
+with open("settings.json", "r", encoding="utf-8") as f:
+    settings = json.load(f)
+cfg = settings[dataset]
+
+# -------------------------- 日志配置 --------------------------
+def setup_logger():
+    """配置日志：同时输出到控制台和文件，文件按大小轮转"""
+    # 日志格式
+    log_format = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    # 根日志器
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)  # 全局日志级别
+
+    # 1. 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_format)
+    console_handler.setLevel(logging.INFO)
+
+    # 2. 文件处理器（轮转，避免单个文件过大）
+    log_dir = f"../logs/{dataset}"
+    os.makedirs(log_dir, exist_ok=True)
+    if cfg['evolve']:
+        flag = 'EVOLVE'
+    elif cfg['test']:
+        flag = 'TEST'
+    else:
+        flag = 'TRAIN'
+    log_file = os.path.join(log_dir, f"{flag}-d{cfg['n_hidden']}_l{cfg['n_layers']}")
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=10*1024*1024,  # 10MB
+        backupCount=5, encoding='utf-8'
+    )
+    file_handler.setFormatter(log_format)
+    file_handler.setLevel(logging.INFO)
+
+    # 添加处理器（避免重复添加）
+    if not logger.handlers:
+        logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+
+    return logger
+
+# 初始化日志
+logger = setup_logger()
 
 # os.environ['KMP_DUPLICATE_LIB_OK']='True'
-def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name):
+def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_path):
     # evolve mode: load parameter form file
     if use_cuda:
         checkpoint = torch.load(model_name, map_location=torch.device(args.gpu))
     else:
         checkpoint = torch.load(model_name, map_location=torch.device('cpu'))
-    print("Load Model name: {}. Using best epoch : {}".format(model_name,
-                                                              checkpoint['epoch']))  # use best stat checkpoint
-    print("\n" + "-" * 10 + "start evolving" + "-" * 10 + "\n")
+    logger.info(f"Load Model name: {model_name}. Using best epoch : {checkpoint['epoch']}")  # use best stat checkpoint
+    logger.info("\n" + "-" * 10 + "start evolving" + "-" * 10 + "\n")
     model.load_state_dict(checkpoint['state_dict'], strict=False)
     # evolve mode: start evolve
     g_list = [build_sub_graph_rel_attr(num_nodes, num_ent, g, use_cuda, args.gpu) for g in evolve_list]
     h = F.normalize(model.dynamic_emb) if model.layer_norm else model.dynamic_emb
 
     history_embs = []
+    g_len = len(g_list)
     for i, g in enumerate(g_list):
+        logger.info(f"evolving: {i}/{g_len}....")
         rel_g, attr_g = g
         rel_g = rel_g.to(model.gpu) if use_cuda else rel_g
         attr_g = attr_g.to(model.gpu) if use_cuda else attr_g
@@ -76,9 +127,10 @@ def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name):
         tmp_h[:model.num_ent] = V_met
         h = tmp_h
         history_embs.append(V_met)
-    print(len(history_embs))
-    for V_met in history_embs:
-        print(V_met.shape)
+    V_mets = torch.stack(history_embs, dim=0)
+    V_mets_np = V_mets.detach().cpu().numpy()
+    os.makedirs(os.path.dirname(embs_path), exist_ok=True)
+    np.save(embs_path, V_mets_np)
 
 
 def test(model, history_list, test_list, num_ent, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, mode):
@@ -106,9 +158,8 @@ def test(model, history_list, test_list, num_ent, num_rels, num_nodes, use_cuda,
             checkpoint = torch.load(model_name, map_location=torch.device(args.gpu))
         else:
             checkpoint = torch.load(model_name, map_location=torch.device('cpu'))
-        print("Load Model name: {}. Using best epoch : {}".format(model_name,
-                                                                  checkpoint['epoch']))  # use best stat checkpoint
-        print("\n" + "-" * 10 + "start testing" + "-" * 10 + "\n")
+        logger.info(f"Load Model name: {model_name}. Using best epoch : {checkpoint['epoch']}")  # use best stat checkpoint
+        logger.info("\n" + "-" * 10 + "start testing" + "-" * 10 + "\n")
         model.load_state_dict(checkpoint['state_dict'], strict=False)
 
     model.eval()
@@ -155,10 +206,11 @@ def test(model, history_list, test_list, num_ent, num_rels, num_nodes, use_cuda,
             input_list.append(test_snap)
         idx += 1
 
-    mrr_raw = utils.stat_ranks(ranks_raw, "raw_ent")
-    mrr_filter = utils.stat_ranks(ranks_filter, "filter_ent")
-    mrr_raw_r = utils.stat_ranks(ranks_raw_r, "raw_rel")
-    mrr_filter_r = utils.stat_ranks(ranks_filter_r, "filter_rel")
+    mrr_raw = utils.stat_ranks(logger, ranks_raw, "raw_ent")
+    mrr_filter = utils.stat_ranks(logger, ranks_filter, "filter_ent")
+    mrr_raw_r = utils.stat_ranks(logger, ranks_raw_r, "raw_rel")
+    mrr_filter_r = utils.stat_ranks(logger, ranks_filter_r, "filter_rel")
+
     return mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r
 
 
@@ -174,7 +226,7 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
         args.n_bases = n_bases
 
     # load graph data
-    print("loading graph data")
+    logger.info("loading graph data")
     data = utils.load_data(args.dataset)
     # 按照时间片划分训练集、验证集、测试集
     all_list = utils.split_by_time(data.all)
@@ -196,8 +248,8 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
                 args.weight, args.discount, args.angle,
                 args.dropout, args.input_dropout, args.hidden_dropout, args.feat_dropout, args.gpu)
     model_state_file = "../models/" + sanitize_filename(model_name) + ".pt"
-    print("Sanity Check: stat name : {}".format(model_state_file))
-    print("Sanity Check: Is cuda available ? {}".format(torch.cuda.is_available()))
+    logger.info(f"Sanity Check: stat name : {model_state_file}")
+    logger.info(f"Sanity Check: Is cuda available ? {torch.cuda.is_available()}")
 
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
 
@@ -240,10 +292,10 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     num_ent = args.entity_number
     if args.evolve and os.path.exists(model_state_file):
-        evolve(model, all_list, num_ent, num_nodes, use_cuda, model_state_file)
+        embs_path = f"../embs/d{args.n_hidden}_l{args.n_layers}"
+        evolve(model, all_list, num_ent, num_nodes, use_cuda, model_state_file, embs_path)
     elif args.evolve and not os.path.exists(model_state_file):
-        print("--------------{} not exist, Change mode to train and generate stat for evolve----------------\n".format(
-            model_state_file))
+        logger.warning(f"--------------{model_state_file} not exist, Change mode to train and generate stat for evolve----------------\n")
     elif args.test and os.path.exists(model_state_file):
         mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r = test(model,
                                                             train_list + valid_list,
@@ -258,10 +310,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
                                                             "test")
         return mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r
     elif args.test and not os.path.exists(model_state_file):
-        print("--------------{} not exist, Change mode to train and generate stat for testing----------------\n".format(
-            model_state_file))
+        logger.warning(f"--------------{model_state_file} not exist, Change mode to train and generate stat for testing----------------\n")
     else:
-        print("----------------------------------------start training----------------------------------------\n")
+        logger.info("----------------------------------------start training----------------------------------------\n")
         best_mrr = 0
         for epoch in range(args.n_epochs):
             model.train()
@@ -298,7 +349,7 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
                 optimizer.step()
                 optimizer.zero_grad()
 
-            print(
+            logger.info(
                 "Epoch {:04d} | Ave Loss: {:.4f} | entity-relation:{:.4f}-{:.4f} Best MRR {:.4f} | Model {} "
                 .format(epoch, np.mean(losses), np.mean(losses_e), np.mean(losses_r), best_mrr,
                         model_name))
@@ -354,10 +405,6 @@ if __name__ == '__main__':
                         help="gpu")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="batch-size")
-    parser.add_argument("-d", "--dataset", type=str, default="NYCMET20140103",
-                        help="dataset to use")
-    parser.add_argument("--test", action='store_true', default=False,  # False
-                        help="load stat from dir and directly test")
     parser.add_argument("--run-analysis", action='store_true', default=False,
                         help="print log info")
     parser.add_argument("--run-statistic", action='store_true', default=False,
@@ -389,8 +436,6 @@ if __name__ == '__main__':
                         help="dropout probability")
     parser.add_argument("--skip-connect", action='store_true', default=False,
                         help="whether to use skip connect in a RGCN Unit")
-    parser.add_argument("--n-hidden", type=int, default=8,    # 8, 16, 24, 32
-                        help="number of hidden units")
     parser.add_argument("--opn", type=str, default="sub",
                         help="opn of compgcn")
 
@@ -398,8 +443,6 @@ if __name__ == '__main__':
                         help="number of weight blocks for each relation")
     parser.add_argument("--n-basis", type=int, default=100,
                         help="number of basis vector for compgcn")
-    parser.add_argument("--n-layers", type=int, default=2,  # 1, 2, 3
-                        help="number of propagation rounds")
     parser.add_argument("--self-loop", action='store_true', default=True,
                         help="perform layer normalization in every layer of gcn ")
     parser.add_argument("--layer-norm", action='store_true', default=False,
@@ -450,26 +493,34 @@ if __name__ == '__main__':
                         help="number of triples generated")
 
     # configuration for data config
-    parser.add_argument("--evolve", action='store_true', default=False,  # False
+    parser.add_argument("-d", "--dataset", type=str, default=dataset,
+                        help="dataset to use")
+    parser.add_argument("--n-hidden", type=int, default=cfg['n_hidden'],    # 8, 16, 24, 32
+                        help="number of hidden units")
+    parser.add_argument("--n-layers", type=int, default=cfg['n_layers'],  # 1, 2, 3
+                        help="number of propagation rounds")
+    parser.add_argument("--evolve", action='store_true', default=cfg['evolve'],  # False
                         help="load stat from dir and directly evolve")
-    parser.add_argument("--entity-number", type=int, default=200,
+    parser.add_argument("--test", action='store_true', default=cfg['test'],  # False
+                        help="load stat from dir and directly test")
+    parser.add_argument("--entity-number", type=int, default=cfg['entity_number'],
                         help="number of entity")
-    parser.add_argument("--relation-number", type=int, default=8,
+    parser.add_argument("--relation-number", type=int, default=cfg['relation_number'],
                         help="number of relation")
-    parser.add_argument("--attribute-number", type=int, default=6,
+    parser.add_argument("--attribute-number", type=int, default=cfg['attribute_number'],
                         help="number of attribute")
 
     args = parser.parse_args()
-    print(args)
+    logger.info(args)
     if args.grid_search:
         out_log = '{}.{}.gs'.format(args.dataset, args.encoder + "-" + args.decoder)
         o_f = open(out_log, 'w')
-        print("** Grid Search **")
+        logger.info("** Grid Search **")
         o_f.write("** Grid Search **\n")
         hyperparameters = args.tune.split(',')
 
         if args.tune == '' or len(hyperparameters) < 1:
-            print("No hyperparameter specified.")
+            logger.error("No hyperparameter specified.")
             sys.exit(0)
         grid = hp_range[hyperparameters[0]]
         for hp in hyperparameters[1:]:
@@ -478,7 +529,7 @@ if __name__ == '__main__':
         hits_at_10s = {}
         mrrs = {}
         grid = list(grid)
-        print('* {} hyperparameter combinations to try'.format(len(grid)))
+        logger.info(f'* {len(grid)} hyperparameter combinations to try')
         o_f.write('* {} hyperparameter combinations to try\n'.format(len(grid)))
         o_f.close()
 
@@ -489,18 +540,18 @@ if __name__ == '__main__':
             if not (type(grid_entry) is list or type(grid_entry) is list):
                 grid_entry = [grid_entry]
             grid_entry = utils.flatten(grid_entry)
-            print('* Hyperparameter Set {}:'.format(i))
+            logger.info(f'* Hyperparameter Set {i}:')
             o_f.write('* Hyperparameter Set {}:\n'.format(i))
             signature = ''
-            print(grid_entry)
+            logger.info(grid_entry)
             o_f.write("\t".join([str(_) for _ in grid_entry]) + "\n")
             # def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=None):
             mrr, hits, ranks = run_experiment(args, grid_entry[0], grid_entry[1], grid_entry[2], grid_entry[3])
-            print("MRR (raw): {:.6f}".format(mrr))
+            logger.info(f"MRR (raw): {mrr:.6f}")
             o_f.write("MRR (raw): {:.6f}\n".format(mrr))
             for hit in hits:
                 avg_count = torch.mean((ranks <= hit).float())
-                print("Hits (raw) @ {}: {:.6f}".format(hit, avg_count.item()))
+                logger.info(f"Hits (raw) @ {hit}: {avg_count.item():.6f}")
                 o_f.write("Hits (raw) @ {}: {:.6f}\n".format(hit, avg_count.item()))
     # single run
     else:

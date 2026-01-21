@@ -161,7 +161,6 @@ class RecurrentRGCN(nn.Module):
         self.h = F.normalize(self.dynamic_emb) if self.layer_norm else self.dynamic_emb[:, :]
         history_embs = []
         for i, g in enumerate(g_list):
-            print(f"{i}/{len(g_list)}")
             rel_g, attr_g = g
             rel_g = rel_g.to(self.gpu) if use_cuda else rel_g
             attr_g = attr_g.to(self.gpu) if use_cuda else attr_g
