@@ -153,46 +153,53 @@ class RecurrentRGCN(nn.Module):
         else:
             raise NotImplementedError
 
-
-    def forward(self, g_list, use_cuda):  # attr-regcn: t-k+1,...,t -> t+1
+    def forward(self, g_list, use_cuda):
         gate_list = []
         degree_list = []
+        device = self.gpu if use_cuda else torch.device("cpu")
 
-        self.h = F.normalize(self.dynamic_emb) if self.layer_norm else self.dynamic_emb[:, :]
+        # 用局部变量 h（不要写 self.h）
+        h = F.normalize(self.dynamic_emb, dim=1) if self.layer_norm else self.dynamic_emb
+
         history_embs = []
-        for i, g in enumerate(g_list):
-            rel_g, attr_g = g
-            rel_g = rel_g.to(self.gpu) if use_cuda else rel_g
-            attr_g = attr_g.to(self.gpu) if use_cuda else attr_g
-            pre_V = self.h[:self.num_ent]
-            # 气象属性编码单元
+        for rel_g, attr_g in g_list:
+            rel_g = rel_g.to(device)
+            attr_g = attr_g.to(device)
+
+            pre_V = h[:self.num_ent]  # (num_ent, h_dim)
+
+            # ===== 你的向量化属性编码里：把 self.h[...] 改为 h[...] =====
             src, dst = attr_g.edges()
-            alpha_vm = torch.zeros(self.num_ent, self.num_attr).to(self.gpu)
-            rel = attr_g.edata['type']
-            assert len(src) == self.num_ent * self.num_attr
-            for _ in range(self.num_ent * self.num_attr):
-                v, m, l = src[_], rel[_] - self.num_rel, dst[_]
-                emb_v, emb_m, emb_l = self.h[v], self.emb_rel[m], self.h[l]
-                alpha_vm[v, m] = (self.q @ torch.tanh(self.W_m @ emb_m + self.W_vm @ emb_l)).squeeze()
+            rel = attr_g.edata["type"]
+            m = rel - self.num_rel
+            emb_m_e = self.emb_rel[m]
+            emb_l_e = h[dst]
+            x = (emb_m_e @ self.W_m.T) + (emb_l_e @ self.W_vm.T)
+            x = torch.tanh(x)
+            score_e = (x * self.q).sum(dim=1)  # q:(1,h_dim) 广播
+
+            alpha_vm = torch.empty(self.num_ent, self.num_attr, device=device, dtype=score_e.dtype)
+            alpha_vm.index_put_((src, m), score_e, accumulate=False)
             alpha_vm = torch.softmax(alpha_vm, dim=1)
-            M = torch.zeros(self.num_ent, self.h_dim).to(self.gpu)
-            for _ in range(self.num_ent * self.num_attr):
-                v, m, l = src[_], rel[_] - self.num_rel, dst[_]
-                emb_l = self.h[l]
-                M[v] += alpha_vm[v, m] * emb_l
-            G = torch.sigmoid((torch.concat([pre_V, M], dim=1)) @ self.W_g + self.b_g)
-            V_attr = (1 - G) * pre_V + G * M
-            V_attr = V_attr[:self.num_ent]
-            # 结构感知的状态传递单元
-            V_P = self.rgcn.forward(rel_g, pre_V, [self.emb_rel, self.emb_rel])  # h(t-1) & r(t) -> hw(t)
-            V_P = F.normalize(V_P) if self.layer_norm else V_P
-            # 门控融合单元
-            U = F.sigmoid(V_attr @ self.W_4 + self.b)
-            V_met = U * V_P + (1 - U) * V_attr
-            tmp_h = self.h.clone()
-            tmp_h[:self.num_ent] = V_met
-            self.h = tmp_h
-            history_embs.append(self.h)
+
+            L = torch.empty(self.num_ent, self.num_attr, self.h_dim, device=device, dtype=emb_l_e.dtype)
+            L.index_put_((src, m), emb_l_e, accumulate=False)
+            M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
+
+            G = torch.sigmoid(torch.cat([pre_V, M], dim=1) @ self.W_g + self.b_g)
+            V_attr = (1.0 - G) * pre_V + G * M
+
+            # ===== 结构传递 =====
+            V_P = self.rgcn.forward(rel_g, pre_V, [self.emb_rel, self.emb_rel])
+            V_P = F.normalize(V_P, dim=1) if self.layer_norm else V_P
+
+            # ===== 门控融合 =====
+            U = torch.sigmoid(V_attr @ self.W_4 + self.b)
+            V_met = U * V_P + (1.0 - U) * V_attr
+            h = torch.cat([V_met, h[self.num_ent:]], dim=0)
+
+            history_embs.append(h)
+
         return history_embs, self.emb_rel, gate_list, degree_list
 
     def predict(self, test_graph, num_rels, test_triplets, use_cuda):
@@ -228,7 +235,7 @@ class RecurrentRGCN(nn.Module):
         if self.entity_prediction:
             scores_ob = self.decoder_ob.forward(pre_emb, r_emb, all_triples).view(-1, self.num_ents)
             loss_ent += self.loss_e(scores_ob, all_triples[:, 2])
-     
+
         if self.relation_prediction:
             score_rel = self.rdecoder.forward(pre_emb, r_emb, all_triples, mode="train").view(-1, 2 * self.num_rels)
             loss_rel += self.loss_r(score_rel, all_triples[:, 1])

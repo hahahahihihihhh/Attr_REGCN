@@ -2,7 +2,7 @@
   "TEST": {
     "n_hidden": 8,
     "n_layers": 2,
-    "evolve": true,
+    "evolve": false,
     "test": false,
     "entity_number": 3,
     "relation_number": 4,
@@ -10,8 +10,8 @@
   },
   "NYCTAXI20140103": {
     "n_hidden": 8,
-    "n_layers": 2,
-    "evolve": true,
+    "n_layers": 1,
+    "evolve": false,
     "test": false,
     "entity_number": 200,
     "relation_number": 8,

@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
 
 import numpy as np
 import torch
@@ -28,10 +27,12 @@ from src.hyperparameter_range import hp_range
 import torch.nn.modules.rnn
 import torch.nn.functional as F
 
-dataset = "TEST"  # 你可改成自己的 key
+
+dataset = "NYCTAXI20140103"  # 你可改成自己的 dataset
 with open("settings.json", "r", encoding="utf-8") as f:
     settings = json.load(f)
 cfg = settings[dataset]
+
 
 # -------------------------- 日志配置 --------------------------
 def setup_logger():
@@ -60,9 +61,10 @@ def setup_logger():
     else:
         flag = 'TRAIN'
     log_file = os.path.join(log_dir, f"{flag}-d{cfg['n_hidden']}_l{cfg['n_layers']}")
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=10*1024*1024,  # 10MB
-        backupCount=5, encoding='utf-8'
+    file_handler = logging.FileHandler(
+        log_file,
+        mode='w',  # 覆盖写入
+        encoding='utf-8'
     )
     file_handler.setFormatter(log_format)
     file_handler.setLevel(logging.INFO)
@@ -74,9 +76,9 @@ def setup_logger():
 
     return logger
 
+
 # 初始化日志
 logger = setup_logger()
-
 # os.environ['KMP_DUPLICATE_LIB_OK']='True'
 def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_path):
     # evolve mode: load parameter form file
@@ -89,47 +91,46 @@ def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_pa
     model.load_state_dict(checkpoint['state_dict'], strict=False)
     # evolve mode: start evolve
     g_list = [build_sub_graph_rel_attr(num_nodes, num_ent, g, use_cuda, args.gpu) for g in evolve_list]
-    h = F.normalize(model.dynamic_emb) if model.layer_norm else model.dynamic_emb
-
-    history_embs = []
+    device = model.gpu if use_cuda else torch.device("cpu")
+    # 用局部变量 h（不要写 self.h）
+    h = F.normalize(model.dynamic_emb, dim=1) if model.layer_norm else model.dynamic_emb
     g_len = len(g_list)
+    history_embs = []
     for i, g in enumerate(g_list):
-        logger.info(f"evolving: {i}/{g_len}....")
+        logger.info(f"evolving -> {i}/{g_len}")
         rel_g, attr_g = g
-        rel_g = rel_g.to(model.gpu) if use_cuda else rel_g
-        attr_g = attr_g.to(model.gpu) if use_cuda else attr_g
-        pre_V = h[:model.num_ent]
-        # 气象属性编码单元
+        rel_g = rel_g.to(device)
+        attr_g = attr_g.to(device)
+        pre_V = h[:model.num_ent]  # (num_ent, h_dim)
+        # ===== 你的向量化属性编码里：把 self.h[...] 改为 h[...] =====
         src, dst = attr_g.edges()
-        alpha_vm = torch.zeros(model.num_ent, model.num_attr).to(model.gpu)
-        rel = attr_g.edata['type']
-        assert len(src) == model.num_ent * model.num_attr
-        for _ in range(model.num_ent * model.num_attr):
-            v, m, l = src[_], rel[_] - model.num_rel, dst[_]
-            emb_v, emb_m, emb_l = h[v], model.emb_rel[m], h[l]
-            alpha_vm[v, m] = (model.q @ torch.tanh(model.W_m @ emb_m + model.W_vm @ emb_l)).squeeze()
+        rel = attr_g.edata["type"]
+        m = rel - model.num_rel
+        emb_m_e = model.emb_rel[m]
+        emb_l_e = h[dst]
+        x = (emb_m_e @ model.W_m.T) + (emb_l_e @ model.W_vm.T)
+        x = torch.tanh(x)
+        score_e = (x * model.q).sum(dim=1)  # q:(1,h_dim) 广播
+        alpha_vm = torch.empty(model.num_ent, model.num_attr, device=device, dtype=score_e.dtype)
+        alpha_vm.index_put_((src, m), score_e, accumulate=False)
         alpha_vm = torch.softmax(alpha_vm, dim=1)
-        M = torch.zeros(model.num_ent, model.h_dim).to(model.gpu)
-        for _ in range(model.num_ent * model.num_attr):
-            v, m, l = src[_], rel[_] - model.num_rel, dst[_]
-            emb_l = h[l]
-            M[v] += alpha_vm[v, m] * emb_l
-        G = torch.sigmoid((torch.concat([pre_V, M], dim=1)) @ model.W_g + model.b_g)
-        V_attr = (1 - G) * pre_V + G * M
-        V_attr = V_attr[:model.num_ent]
-        # 结构感知的状态传递单元
-        V_P = model.rgcn.forward(rel_g, pre_V, [model.emb_rel, model.emb_rel])  # h(t-1) & r(t) -> hw(t)
-        V_P = F.normalize(V_P) if model.layer_norm else V_P
-        # 门控融合单元
-        U = F.sigmoid(V_attr @ model.W_4 + model.b)
-        V_met = U * V_P + (1 - U) * V_attr
-        tmp_h = h.clone()
-        tmp_h[:model.num_ent] = V_met
-        h = tmp_h
-        history_embs.append(V_met)
+        L = torch.empty(model.num_ent, model.num_attr, model.h_dim, device=device, dtype=emb_l_e.dtype)
+        L.index_put_((src, m), emb_l_e, accumulate=False)
+        M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
+        G = torch.sigmoid(torch.cat([pre_V, M], dim=1) @ model.W_g + model.b_g)
+        V_attr = (1.0 - G) * pre_V + G * M
+        # ===== 结构传递 =====
+        V_P = model.rgcn.forward(rel_g, pre_V, [model.emb_rel, model.emb_rel])
+        V_P = F.normalize(V_P, dim=1) if model.layer_norm else V_P
+        # ===== 门控融合 =====
+        U = torch.sigmoid(V_attr @ model.W_4 + model.b)
+        V_met = U * V_P + (1.0 - U) * V_attr
+        h = torch.cat([V_met, h[model.num_ent:]], dim=0)
+        history_embs.append(h)
     V_mets = torch.stack(history_embs, dim=0)
-    V_mets_np = V_mets.detach().cpu().numpy()
+    V_mets_np = V_mets[:, :model.num_ent, :].detach().cpu().numpy()
     os.makedirs(os.path.dirname(embs_path), exist_ok=True)
+    logger.info(f"Saving to {embs_path}, shape: {V_mets_np.shape}")
     np.save(embs_path, V_mets_np)
 
 
@@ -243,11 +244,13 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, False)
     all_ans_list_r_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, True)
 
-    model_name = "{}-{}-{}-ly{}-dilate{}-his{}-weight:{}-discount:{}-angle:{}-dp{}|{}|{}|{}-gpu{}" \
-        .format(args.dataset, args.encoder, args.decoder, args.n_layers, args.dilate_len, args.train_history_len,
+    model_name = "{}-{}-{}-ly{}-hidden{}-his{}-weight:{}-discount:{}-angle:{}-dp{}|{}|{}|{}-gpu{}" \
+        .format(args.dataset, args.encoder, args.decoder, args.n_layers, args.n_hidden, args.train_history_len,
                 args.weight, args.discount, args.angle,
                 args.dropout, args.input_dropout, args.hidden_dropout, args.feat_dropout, args.gpu)
-    model_state_file = "../models/" + sanitize_filename(model_name) + ".pt"
+    model_state_dir = f"../models/{args.dataset}/"
+    os.makedirs(os.path.dirname(model_state_dir), exist_ok=True)
+    model_state_file = model_state_dir + sanitize_filename(model_name) + ".pt"
     logger.info(f"Sanity Check: stat name : {model_state_file}")
     logger.info(f"Sanity Check: Is cuda available ? {torch.cuda.is_available()}")
 
@@ -292,7 +295,7 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     num_ent = args.entity_number
     if args.evolve and os.path.exists(model_state_file):
-        embs_path = f"../embs/d{args.n_hidden}_l{args.n_layers}"
+        embs_path = f"../embs/{args.dataset}/d{args.n_hidden}_l{args.n_layers}"
         evolve(model, all_list, num_ent, num_nodes, use_cuda, model_state_file, embs_path)
     elif args.evolve and not os.path.exists(model_state_file):
         logger.warning(f"--------------{model_state_file} not exist, Change mode to train and generate stat for evolve----------------\n")
@@ -355,7 +358,7 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
                         model_name))
 
             # validation
-            if epoch and epoch % args.evaluate_every == 0:
+            if (epoch + 1) % args.evaluate_every == 0:
                 mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r = test(model,
                                                                     train_list,
                                                                     valid_list,
@@ -455,15 +458,16 @@ if __name__ == '__main__':
                         help="do relation prediction")
 
     # configuration for stat training
-    parser.add_argument("--n-epochs", type=int, default=10,  # 500
+    parser.add_argument("--n-epochs", type=int, default=5,  # 500
                         help="number of minimum training epochs on each time step")
     parser.add_argument("--lr", type=float, default=0.001,
-                        help="learning rate")
+                        help
+         ="learning rate")
     parser.add_argument("--grad-norm", type=float, default=1.0,
                         help="norm to clip gradient to")
 
     # configuration for evaluating
-    parser.add_argument("--evaluate-every", type=int, default=5,  # 20
+    parser.add_argument("--evaluate-every", type=int, default=1,  # 20
                         help="perform evaluation every n epochs")
 
     # configuration for decoder
@@ -477,7 +481,7 @@ if __name__ == '__main__':
                         help="feat dropout for decoder")
 
     # configuration for sequences stat
-    parser.add_argument("--train-history-len", type=int, default=3,  # 10
+    parser.add_argument("--train-history-len", type=int, default=10,  # 10
                         help="history length")
     parser.add_argument("--test-history-len", type=int, default=1,  # 20
                         help="history length for test")
@@ -495,9 +499,9 @@ if __name__ == '__main__':
     # configuration for data config
     parser.add_argument("-d", "--dataset", type=str, default=dataset,
                         help="dataset to use")
-    parser.add_argument("--n-hidden", type=int, default=cfg['n_hidden'],    # 8, 16, 24, 32
+    parser.add_argument("--n-hidden", type=int, default=cfg['n_hidden'],    # 8, 16, 24, 32, 40
                         help="number of hidden units")
-    parser.add_argument("--n-layers", type=int, default=cfg['n_layers'],  # 1, 2, 3
+    parser.add_argument("--n-layers", type=int, default=cfg['n_layers'],  # 1, 2, 3, 4
                         help="number of propagation rounds")
     parser.add_argument("--evolve", action='store_true', default=cfg['evolve'],  # False
                         help="load stat from dir and directly evolve")
