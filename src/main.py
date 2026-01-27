@@ -28,7 +28,7 @@ import torch.nn.modules.rnn
 import torch.nn.functional as F
 
 
-dataset = "NYCTAXI20140103"  # 你可改成自己的 dataset
+dataset = "TEST"  # 你可改成自己的 dataset
 with open("settings.json", "r", encoding="utf-8") as f:
     settings = json.load(f)
 cfg = settings[dataset]
@@ -117,14 +117,12 @@ def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_pa
         L = torch.empty(model.num_ent, model.num_attr, model.h_dim, device=device, dtype=emb_l_e.dtype)
         L.index_put_((src, m), emb_l_e, accumulate=False)
         M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
-        G = torch.sigmoid(torch.cat([pre_V, M], dim=1) @ model.W_g + model.b_g)
-        V_attr = (1.0 - G) * pre_V + G * M
         # ===== 结构传递 =====
         V_P = model.rgcn.forward(rel_g, pre_V, [model.emb_rel, model.emb_rel])
         V_P = F.normalize(V_P, dim=1) if model.layer_norm else V_P
         # ===== 门控融合 =====
-        U = torch.sigmoid(V_attr @ model.W_4 + model.b)
-        V_met = U * V_P + (1.0 - U) * V_attr
+        G = torch.sigmoid(torch.cat([V_P, M], dim=1) @ model.W_g + model.b_g)
+        V_met = G * V_P + (1.0 - G) * M
         h = torch.cat([V_met, h[model.num_ent:]], dim=0)
         history_embs.append(h)
     V_mets = torch.stack(history_embs, dim=0)

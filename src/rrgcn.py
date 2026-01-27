@@ -186,16 +186,13 @@ class RecurrentRGCN(nn.Module):
             L.index_put_((src, m), emb_l_e, accumulate=False)
             M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
 
-            G = torch.sigmoid(torch.cat([pre_V, M], dim=1) @ self.W_g + self.b_g)
-            V_attr = (1.0 - G) * pre_V + G * M
-
             # ===== 结构传递 =====
             V_P = self.rgcn.forward(rel_g, pre_V, [self.emb_rel, self.emb_rel])
             V_P = F.normalize(V_P, dim=1) if self.layer_norm else V_P
 
             # ===== 门控融合 =====
-            U = torch.sigmoid(V_attr @ self.W_4 + self.b)
-            V_met = U * V_P + (1.0 - U) * V_attr
+            G = torch.sigmoid(torch.cat([V_P, M], dim=1) @ self.W_g + self.b_g)
+            V_met = G * V_P + (1.0 - G) * M
             h = torch.cat([V_met, h[self.num_ent:]], dim=0)
 
             history_embs.append(h)

@@ -2,7 +2,7 @@
   "TEST": {
     "n_hidden": 8,
     "n_layers": 2,
-    "evolve": false,
+    "evolve": true,
     "test": false,
     "entity_number": 3,
     "relation_number": 4,
