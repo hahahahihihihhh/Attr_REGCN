@@ -63,6 +63,7 @@ class RecurrentRGCN(nn.Module):
                  gpu=0, analysis=False):
         super(RecurrentRGCN, self).__init__()
 
+        self.num_hidden_layers = num_hidden_layers
         self.decoder_name = decoder_name
         self.encoder_name = encoder_name
         self.num_rels = num_rels
@@ -187,12 +188,13 @@ class RecurrentRGCN(nn.Module):
             M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
 
             # ===== 结构传递 =====
-            V_P = self.rgcn.forward(rel_g, pre_V, [self.emb_rel, self.emb_rel])
+            V_P = self.rgcn.forward(rel_g, pre_V, [self.emb_rel.clone() for _ in range(self.num_hidden_layers)])
             V_P = F.normalize(V_P, dim=1) if self.layer_norm else V_P
-
             # ===== 门控融合 =====
             G = torch.sigmoid(torch.cat([V_P, M], dim=1) @ self.W_g + self.b_g)
             V_met = G * V_P + (1.0 - G) * M
+            # ablation
+            # h = torch.cat([M, h[self.num_ent:]], dim=0)
             h = torch.cat([V_met, h[self.num_ent:]], dim=0)
 
             history_embs.append(h)

@@ -1,7 +1,7 @@
 {
   "TEST": {
-    "n_hidden": 8,
-    "n_layers": 2,
+    "n_hidden": 16,
+    "n_layers": 3,
     "evolve": true,
     "test": false,
     "entity_number": 3,
@@ -9,8 +9,8 @@
     "attribute_number": 2
   },
   "NYCTAXI20140103": {
-    "n_hidden": 8,
-    "n_layers": 1,
+    "n_hidden": 24,
+    "n_layers": 3,
     "evolve": false,
     "test": false,
     "entity_number": 200,
@@ -19,7 +19,7 @@
   },
   "TDRIVE20150406": {
     "n_hidden": 8,
-    "n_layers": 2,
+    "n_layers": 3,
     "evolve": true,
     "test": false,
     "entity_number": 1024,
