@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+from tabnanny import check
 
 import numpy as np
 import torch
@@ -76,62 +77,88 @@ def setup_logger():
 
     return logger
 
+def chk(name, t):
+    if not torch.isfinite(t).all():
+        bad = (~torch.isfinite(t)).nonzero(as_tuple=False)
+        logger.error(f"[NaN/Inf] {name}: shape={tuple(t.shape)}, bad_count={bad.shape[0]}")
+        # 打印一些统计（注意：含 NaN 时 min/max 会是 NaN，所以用 nan_to_num）
+        tt = torch.nan_to_num(t.detach(), nan=0.0, posinf=1e6, neginf=-1e6)
+        logger.error(f"[stats] {name}: min={tt.min().item():.4g}, max={tt.max().item():.4g}, mean={tt.mean().item():.4g}")
+        logger.error(f"[first bad idx] {bad[0].tolist()}")
+        raise RuntimeError(f"{name} has NaN/Inf")
 
 # 初始化日志
 logger = setup_logger()
 # os.environ['KMP_DUPLICATE_LIB_OK']='True'
-def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_path):
-    # evolve mode: load parameter form file
+def evolve(model, evolve_list, num_ent, num_nodes, use_cuda, model_name, embs_path, eps=1e-12):
+    # -------------------------
+    # load checkpoint
+    # -------------------------
     if use_cuda:
         checkpoint = torch.load(model_name, map_location=torch.device(args.gpu))
     else:
-        checkpoint = torch.load(model_name, map_location=torch.device('cpu'))
-    logger.info(f"Load Model name: {model_name}. Using best epoch : {checkpoint['epoch']}")  # use best stat checkpoint
+        checkpoint = torch.load(model_name, map_location=torch.device("cpu"))
+    logger.info(f"Load Model name: {model_name}. Using best epoch : {checkpoint.get('epoch', 'N/A')}")
     logger.info("\n" + "-" * 10 + "start evolving" + "-" * 10 + "\n")
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
-    # evolve mode: start evolve
-    g_list = [build_sub_graph_rel_attr(num_nodes, num_ent, g, use_cuda, args.gpu) for g in evolve_list]
+    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    model.eval()
     device = model.gpu if use_cuda else torch.device("cpu")
-    # 用局部变量 h（不要写 self.h）
-    h = F.normalize(model.dynamic_emb, dim=1) if model.layer_norm else model.dynamic_emb
-    g_len = len(g_list)
-    history_embs = []
-    for i, g in enumerate(g_list):
-        logger.info(f"evolving -> {i}/{g_len}")
-        rel_g, attr_g = g
-        rel_g = rel_g.to(device)
-        attr_g = attr_g.to(device)
-        pre_V = h[:model.num_ent]  # (num_ent, h_dim)
-        # ===== 你的向量化属性编码里：把 self.h[...] 改为 h[...] =====
-        src, dst = attr_g.edges()
-        rel = attr_g.edata["type"]
-        m = rel - model.num_rel
-        emb_m_e = model.emb_rel[m]
-        emb_l_e = h[dst]
-        x = (emb_m_e @ model.W_m.T) + (emb_l_e @ model.W_vm.T)
-        x = torch.tanh(x)
-        score_e = (x * model.q).sum(dim=1)  # q:(1,h_dim) 广播
-        alpha_vm = torch.empty(model.num_ent, model.num_attr, device=device, dtype=score_e.dtype)
-        alpha_vm.index_put_((src, m), score_e, accumulate=False)
-        alpha_vm = torch.softmax(alpha_vm, dim=1)
-        L = torch.empty(model.num_ent, model.num_attr, model.h_dim, device=device, dtype=emb_l_e.dtype)
-        L.index_put_((src, m), emb_l_e, accumulate=False)
-        M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
-        # ===== 结构传递 =====
-        V_P = model.rgcn.forward(rel_g, pre_V, [model.emb_rel.clone() for _ in range(model.num_hidden_layers)])
-        V_P = F.normalize(V_P, dim=1) if model.layer_norm else V_P
-        # ===== 门控融合 =====
-        G = torch.sigmoid(torch.cat([V_P, M], dim=1) @ model.W_g + model.b_g)
-        V_met = G * V_P + (1.0 - G) * M
-        # ablation
-        # h = torch.cat([M, h[model.num_ent:]], dim=0)
-        h = torch.cat([V_met, h[model.num_ent:]], dim=0)
-        history_embs.append(h)
-    V_mets = torch.stack(history_embs, dim=0)
-    V_mets_np = V_mets[:, :model.num_ent, :].detach().cpu().numpy()
+    # -------------------------
+    # init h (full node embedding!)
+    # -------------------------
+    # model.dynamic_emb 一般是 (num_nodes, h_dim)
+    h = model.dynamic_emb
+    h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+    g_len = len(evolve_list)
+    V_mets_np = np.zeros((g_len, model.num_ent, model.h_dim), dtype=np.float32)
+
+    # -------------------------
+    # evolve (streaming: avoid storing 2160 graphs)
+    # -------------------------
+    with torch.inference_mode():
+        for i, g in enumerate(evolve_list):
+            logger.info(f"evolving -> {i}/{g_len}")
+            # 每次现建子图，避免 g_list 占内存
+            rel_g, attr_g = build_sub_graph_rel_attr(num_nodes, num_ent, g, use_cuda, args.gpu)
+            rel_g = rel_g.to(device)
+            attr_g = attr_g.to(device)
+            # ===== 每步稳定化实体嵌入 =====
+            h_ent = torch.nan_to_num(h[:model.num_ent], nan=0.0, posinf=0.0, neginf=0.0)
+            pre_V = F.normalize(h_ent, dim=1, eps=eps)  # (num_ent, h_dim)
+            # ===== 属性编码 =====
+            h_full = torch.cat([pre_V, h[model.num_ent:]], dim=0)
+            src, dst = attr_g.edges()
+            rel = attr_g.edata["type"]
+            m = rel - model.num_rel
+            emb_m_e = model.emb_rel[m]                                # (E_attr, h_dim)
+            emb_l_e = h_full[dst]                                     # 注意：这里必须用 h_full，不要用 pre_V
+            x = (emb_m_e @ model.W_m.T) + (emb_l_e @ model.W_vm.T)
+            x = torch.tanh(x)
+            score_e = (x * model.q).sum(dim=1)
+            alpha_vm = torch.zeros(model.num_ent, model.num_attr, device=device, dtype=score_e.dtype)
+            alpha_vm.index_put_((src, m), score_e, accumulate=False)
+            alpha_vm = torch.softmax(alpha_vm, dim=1)
+            L = torch.zeros(model.num_ent, model.num_attr, model.h_dim, device=device, dtype=emb_l_e.dtype)
+            L.index_put_((src, m), emb_l_e, accumulate=False)
+            M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
+            M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+            M = F.normalize(M, dim=1, eps=eps)
+            # ===== 结构传递 =====
+            V_P = model.rgcn.forward(rel_g, pre_V, [model.emb_rel] * model.num_hidden_layers)
+            V_P = torch.nan_to_num(V_P, nan=0.0, posinf=0.0, neginf=0.0)
+            V_P = F.normalize(V_P, dim=1, eps=eps)
+            # ===== 门控融合 =====
+            G = torch.sigmoid(torch.cat([V_P, M], dim=1) @ model.W_g + model.b_g)
+            V_met = G * V_P + (1.0 - G) * M
+            V_met = torch.nan_to_num(V_met, nan=0.0, posinf=0.0, neginf=0.0)
+            V_met = F.normalize(V_met, dim=1, eps=eps)
+            # ===== 保存当前步实体嵌入到 CPU =====
+            V_mets_np[i] = V_met.detach().float().cpu().numpy()
+            h = torch.cat([V_met, h[model.num_ent:]], dim=0)
+
     os.makedirs(os.path.dirname(embs_path), exist_ok=True)
-    logger.info(f"Saving to {embs_path}, shape: {V_mets_np.shape}")
     np.save(embs_path, V_mets_np)
+    logger.info(f"Saved evolved embeddings to {embs_path}, shape={V_mets_np.shape}")
 
 
 def test(model, history_list, test_list, num_ent, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, mode):

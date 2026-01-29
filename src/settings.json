@@ -9,8 +9,8 @@
     "attribute_number": 2
   },
   "NYCTAXI20140103": {
-    "n_hidden": 24,
-    "n_layers": 3,
+    "n_hidden": 32,
+    "n_layers": 1,
     "evolve": false,
     "test": false,
     "entity_number": 200,
@@ -18,7 +18,7 @@
     "attribute_number": 6
   },
   "TDRIVE20150406": {
-    "n_hidden": 8,
+    "n_hidden": 32,
     "n_layers": 3,
     "evolve": true,
     "test": false,

@@ -179,11 +179,11 @@ class RecurrentRGCN(nn.Module):
             x = torch.tanh(x)
             score_e = (x * self.q).sum(dim=1)  # q:(1,h_dim) 广播
 
-            alpha_vm = torch.empty(self.num_ent, self.num_attr, device=device, dtype=score_e.dtype)
+            alpha_vm = torch.zeros(self.num_ent, self.num_attr, device=device, dtype=score_e.dtype)
             alpha_vm.index_put_((src, m), score_e, accumulate=False)
             alpha_vm = torch.softmax(alpha_vm, dim=1)
 
-            L = torch.empty(self.num_ent, self.num_attr, self.h_dim, device=device, dtype=emb_l_e.dtype)
+            L = torch.zeros(self.num_ent, self.num_attr, self.h_dim, device=device, dtype=emb_l_e.dtype)
             L.index_put_((src, m), emb_l_e, accumulate=False)
             M = (alpha_vm.unsqueeze(-1) * L).sum(dim=1)
 
